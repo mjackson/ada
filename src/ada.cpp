@@ -8,6 +8,7 @@
 #include "parser.cpp"
 #include "url_components.cpp"
 #include "url_aggregator.cpp"
+#include "url_search_params.cpp"
 #include "url_pattern.cpp"
 #include "url_pattern_helpers.cpp"
 #include "url_pattern_regex.cpp"

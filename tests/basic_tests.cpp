@@ -505,3 +505,16 @@ TYPED_TEST(basic_tests, test_possible_asan) {
   ASSERT_EQ(url->get_protocol(), "file:");
   SUCCEED();
 }
+
+TEST(url_aggregator, estimated_memory_usage_tracks_retained_capacity) {
+  auto url = ada::parse<ada::url_aggregator>("https://example.com/");
+  ASSERT_TRUE(url);
+
+  const size_t initial_estimate = url->estimated_memory_usage();
+  ASSERT_GE(initial_estimate, url->get_href().size());
+
+  const std::string large_url = "https://example.com/" + std::string(8192, 'a');
+  ASSERT_TRUE(url->set_href(large_url));
+  ASSERT_GE(url->estimated_memory_usage(), url->get_href().size());
+  ASSERT_GT(url->estimated_memory_usage(), initial_estimate);
+}
