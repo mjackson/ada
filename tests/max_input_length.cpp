@@ -194,8 +194,8 @@ TYPED_TEST(max_input_length_tests, parse_normalized_exceeds_limit) {
   std::string input = "http://x/" + std::string(339, ' ') + "y";
   ASSERT_LE(input.size(), small_limit);
   auto result = ada::parse<TypeParam>(input);
-  // The normalized URL should be 10 + 339*3 = 1027 bytes, exceeding the limit.
   ASSERT_FALSE(result);
+  ASSERT_FALSE(ada::can_parse(input));
 }
 
 TYPED_TEST(max_input_length_tests, parse_normalized_just_under_limit) {
@@ -206,6 +206,25 @@ TYPED_TEST(max_input_length_tests, parse_normalized_just_under_limit) {
   auto result = ada::parse<TypeParam>(input);
   ASSERT_TRUE(result);
   ASSERT_LE(result->get_href().size(), small_limit);
+}
+
+TYPED_TEST(max_input_length_tests, can_parse_matches_parse_for_idna_expansion) {
+  // IDNA expands a host by more than the 3x that percent-encoding produces:
+  // U+337F is 3 UTF-8 bytes and becomes the 17-byte "xn--6oqv20b1zgzxr", so a
+  // dotted host sustains 4.5x once the label separator is amortized.
+  //
+  // 60 labels: input = 5 + 60*3 + 59 + 1 = 245 bytes, well under the limit.
+  // Normalized = 5 + 60*17 + 59 + 1 = 1085 bytes > 1024.
+  std::string host;
+  for (int i = 0; i < 60; i++) {
+    if (i) host += ".";
+    host += "\xe3\x8d\xbf";
+  }
+  std::string input = "ws://" + host + "/";
+  ASSERT_LE(input.size(), small_limit);
+  auto result = ada::parse<TypeParam>(input);
+  ASSERT_FALSE(result);
+  ASSERT_FALSE(ada::can_parse(input));
 }
 
 TYPED_TEST(max_input_length_tests, parse_with_base_normalized_exceeds_limit) {
@@ -219,6 +238,8 @@ TYPED_TEST(max_input_length_tests, parse_with_base_normalized_exceeds_limit) {
   ASSERT_LE(relative_input.size(), small_limit);
   auto result = ada::parse<TypeParam>(relative_input, &*base);
   ASSERT_FALSE(result);
+  std::string_view base_view = "http://x/";
+  ASSERT_FALSE(ada::can_parse(relative_input, &base_view));
 }
 
 TYPED_TEST(max_input_length_tests, set_protocol_url_unchanged_after_reject) {
@@ -229,4 +250,77 @@ TYPED_TEST(max_input_length_tests, set_protocol_url_unchanged_after_reject) {
   std::string long_protocol(small_limit, 'z');
   ASSERT_FALSE(result->set_protocol(long_protocol));
   ASSERT_EQ(result->get_href(), original_href);
+}
+
+TEST(max_input_length_helpers, href_from_file_rejects_overlength_input) {
+  const uint32_t previous_limit = ada::get_max_input_length();
+  struct restore_t {
+    uint32_t v;
+    ~restore_t() { ada::set_max_input_length(v); }
+  } restore{previous_limit};
+
+  ada::set_max_input_length(small_limit);
+  std::string long_path(small_limit + 1, 'a');
+  ASSERT_TRUE(ada::href_from_file(long_path).empty());
+}
+
+TEST(max_input_length_helpers, href_from_file_rejects_expanded_result) {
+  // Spaces in the path percent-encode to %20 (3x). With enough spaces the
+  // input stays under the limit while "file://" + encoded path exceeds it.
+  ada::set_max_input_length(small_limit);
+  // "file://" = 7, path starts with '/', spaces encode to "%20".
+  // Result length = 7 + 1 + 3*N. Need 8 + 3*N > 1024 => N > 338.6, use 339.
+  // Input length = 339 (no leading slash in input uses parse path as-is...
+  // For input of N spaces: internal path building may add leading '/'.
+  std::string path(339, ' ');
+  path += 'y';  // avoid trailing-space stripping edge cases on opaque paths
+  ASSERT_LE(path.size(), small_limit);
+  ASSERT_TRUE(ada::href_from_file(path).empty());
+  // Control: fewer spaces must succeed and stay under the limit.
+  std::string short_path(100, ' ');
+  short_path += 'y';
+  std::string ok = ada::href_from_file(short_path);
+  ASSERT_FALSE(ok.empty());
+  ASSERT_LE(ok.size(), small_limit);
+  ASSERT_TRUE(ok.starts_with("file://"));
+  ada::set_max_input_length(std::numeric_limits<uint32_t>::max());
+}
+
+TEST(max_input_length_helpers, href_from_file_accepts_under_limit) {
+  ada::set_max_input_length(small_limit);
+  std::string ok = ada::href_from_file("/home/user/file.txt");
+  ASSERT_FALSE(ok.empty());
+  ASSERT_LE(ok.size(), small_limit);
+  ASSERT_EQ(ok, "file:///home/user/file.txt");
+  ada::set_max_input_length(std::numeric_limits<uint32_t>::max());
+}
+
+TEST(max_input_length_helpers, url_search_params_rejects_overlength_input) {
+  ada::set_max_input_length(small_limit);
+  std::string long_query(small_limit + 1, 'a');
+  long_query += "=b";
+  ada::url_search_params params(long_query);
+  ASSERT_EQ(params.size(), 0);
+  ASSERT_TRUE(params.to_string().empty());
+  ada::set_max_input_length(std::numeric_limits<uint32_t>::max());
+}
+
+TEST(max_input_length_helpers, url_search_params_reset_rejects_overlength) {
+  ada::set_max_input_length(small_limit);
+  ada::url_search_params params("a=b");
+  ASSERT_EQ(params.size(), 1);
+  std::string long_query(small_limit + 1, 'x');
+  long_query += "=y";
+  params.reset(long_query);
+  // reset clears first, then initialize rejects -> empty
+  ASSERT_EQ(params.size(), 0);
+  ada::set_max_input_length(std::numeric_limits<uint32_t>::max());
+}
+
+TEST(max_input_length_helpers, url_search_params_accepts_under_limit) {
+  ada::set_max_input_length(small_limit);
+  ada::url_search_params params("foo=bar&baz=qux");
+  ASSERT_EQ(params.size(), 2);
+  ASSERT_EQ(params.get("foo"), "bar");
+  ada::set_max_input_length(std::numeric_limits<uint32_t>::max());
 }

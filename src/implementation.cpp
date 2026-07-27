@@ -288,6 +288,14 @@ template ada::result<url_aggregator> parse<url_aggregator>(
     std::string_view input, const url_aggregator* base_url = nullptr);
 
 std::string href_from_file(std::string_view input) {
+  // Match ada::parse / setters: refuse inputs that already exceed the limit.
+  // Path percent-encoding can still expand the result, so we also check the
+  // final href below.
+  const uint32_t max_length = ada::get_max_input_length();
+  if (input.size() > max_length) {
+    return {};
+  }
+
   // This is going to be much faster than constructing a URL.
   std::string tmp_buffer;
   std::string_view internal_input;
@@ -307,25 +315,43 @@ std::string href_from_file(std::string_view input) {
   } else {
     helpers::parse_prepared_path(internal_input, ada::scheme::type::FILE, path);
   }
-  return "file://" + path;
+  std::string result = "file://" + path;
+  if (result.size() > max_length) {
+    return {};
+  }
+  return result;
 }
 
 bool can_parse(std::string_view input, const std::string_view* base_input) {
-  // Fast path: handles the overwhelming majority of inputs -- absolute special
-  // URLs with an ASCII domain, no credentials, and no base -- with a single
-  // forward scan and zero allocations.
+  // Must match parse().has_value(), including post-normalization max length.
+  // Percent-encoding expands a byte by at most 3x, but IDNA expands more: a
+  // 3-byte UTF-8 label such as U+337F becomes the 17-byte "xn--6oqv20b1zgzxr",
+  // so a dotted host sustains 4.5x. When the input (plus base, if any) fits in
+  // max_length/5, the normalized href cannot exceed max_length, so
+  // validation-only parsing (store_values=false) is safe.
+
+  // Hot path first: absolute special URLs, no base. Avoid loading max_length
+  // until we need it (common absolute-fast true/false cases).
   if (base_input == nullptr) {
     if (const auto r = try_can_parse_absolute_fast(input)) {
-      return *r;
+      if (!*r) {
+        return false;
+      }
+      // size <= max/5 => normalized href cannot exceed max (4.5x expansion).
+      // Check this first: default max is ~4GB so almost all URLs return true.
+      const uint32_t max_length = ada::get_max_input_length();
+      if (input.size() <= static_cast<size_t>(max_length) / 5) {
+        return true;
+      }
+      if (input.size() > max_length) {
+        return false;
+      }
+      return ada::parser::parse_url_impl<ada::url_aggregator, true>(input,
+                                                                    nullptr)
+          .is_valid;
     }
   }
 
-  // Reject inputs that exceed the configurable maximum length.
-  // This check is placed after the fast path so the common case (default 4 GB
-  // limit, absolute URLs) pays no overhead.
-  // Note: can_parse() does not perform normalization (percent-encoding, IDNA),
-  // so it cannot detect cases where a short input normalizes into a long URL.
-  // In such edge cases can_parse() may return true while parse() fails.
   const uint32_t max_length = ada::get_max_input_length();
   if (input.size() > max_length) {
     return false;
@@ -334,21 +360,43 @@ bool can_parse(std::string_view input, const std::string_view* base_input) {
     return false;
   }
 
-  // Fallback: run the parser in validation-only mode (store_values=false),
-  // which skips all the expensive work that isn't needed to determine validity:
-  // buffer reservation, credential encoding, path normalisation, query and
-  // fragment percent-encoding.  The host is still fully validated (IDNA, IPv4,
-  // IPv6) because parse_host() must run for correctness.
-  ada::url_aggregator base_agg;
-  ada::url_aggregator* base_ptr = nullptr;
-  if (base_input != nullptr) {
-    base_agg = ada::parser::parse_url_impl<ada::url_aggregator, false>(
-        *base_input, nullptr);
-    if (!base_agg.is_valid) return false;
-    base_ptr = &base_agg;
+  // Relative resolution combines base + input; bound the sum so 4.5x expansion
+  // of either side cannot push the final href past max_length.
+  const size_t combined =
+      input.size() + (base_input == nullptr ? 0 : base_input->size());
+  const bool size_safe = combined <= static_cast<size_t>(max_length) / 5;
+
+  if (size_safe) {
+    // Validation-only: no buffer build, host still fully checked.
+    ada::url_aggregator base_agg;
+    ada::url_aggregator* base_ptr = nullptr;
+    if (base_input != nullptr) {
+      base_agg = ada::parser::parse_url_impl<ada::url_aggregator, false>(
+          *base_input, nullptr);
+      if (!base_agg.is_valid) {
+        return false;
+      }
+      base_ptr = &base_agg;
+    }
+    return ada::parser::parse_url_impl<ada::url_aggregator, false>(input,
+                                                                   base_ptr)
+        .is_valid;
   }
-  return ada::parser::parse_url_impl<ada::url_aggregator, false>(input,
-                                                                 base_ptr)
+
+  // Near the limit: full parse so post-normalization length matches parse().
+  if (base_input == nullptr) {
+    return ada::parser::parse_url_impl<ada::url_aggregator, true>(input,
+                                                                  nullptr)
+        .is_valid;
+  }
+  ada::url_aggregator base_agg =
+      ada::parser::parse_url_impl<ada::url_aggregator, true>(*base_input,
+                                                             nullptr);
+  if (!base_agg.is_valid) {
+    return false;
+  }
+  return ada::parser::parse_url_impl<ada::url_aggregator, true>(input,
+                                                                &base_agg)
       .is_valid;
 }
 

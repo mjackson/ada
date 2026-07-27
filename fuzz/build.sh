@@ -59,13 +59,9 @@ $CXX -DADA_USE_UNSAFE_STD_REGEX_PROVIDER=1 \
 $CXX $CFLAGS $CXXFLAGS \
      -std=c++20 \
      -I build/singleheader \
-     -c build/singleheader/ada.cpp -o ada.o
+     -c fuzz/ada_c.cc -o ada_c.o
 
-$CC $CFLAGS $CXXFLAGS \
-     -I build/singleheader \
-     -c fuzz/ada_c.c -o ada_c.o
-
-$CXX $CFLAGS $CXXFLAGS $LIB_FUZZING_ENGINE ./ada.o ada_c.o \
+$CXX $CFLAGS $CXXFLAGS $LIB_FUZZING_ENGINE ada_c.o \
      -o $OUT/ada_c
 
 $CXX $CFLAGS $CXXFLAGS \
@@ -83,6 +79,14 @@ $CXX $CFLAGS $CXXFLAGS \
 
 $CXX $CFLAGS $CXXFLAGS $LIB_FUZZING_ENGINE unicode.o \
      -o $OUT/unicode
+
+$CXX $CFLAGS $CXXFLAGS \
+     -std=c++20 \
+     -I build/singleheader \
+     -c fuzz/simple_absolute.cc -o simple_absolute.o
+
+$CXX $CFLAGS $CXXFLAGS $LIB_FUZZING_ENGINE simple_absolute.o \
+     -o $OUT/simple_absolute
 
 cp $SRC/ada-url/fuzz/*.dict $SRC/ada-url/fuzz/*.options $OUT/
 

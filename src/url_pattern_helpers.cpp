@@ -316,18 +316,20 @@ tl::expected<std::string, errors> canonicalize_hostname(
   }
 
   // Fast path: simple hostnames (lowercase ASCII, digits, -, .) need no IDNA.
-  // The simple character set also covers IPv4-shaped hosts and "xn--" labels,
-  // which the slow path rewrites: it reserializes the address ("0" ->
-  // "0.0.0.0", "0x7f.1" -> "127.0.0.1") and runs IDNA/punycode validation
-  // (rejecting an invalid ACE label such as "xn--a"). Exclude those so the fast
-  // path can't return a non-canonical or wrongly-accepted hostname.
+  // The simple character set also covers IPv4-shaped hosts, which the slow
+  // path rewrites ("0" -> "0.0.0.0", "0x7f.1" -> "127.0.0.1"). Exclude those
+  // so the fast path can't return a non-canonical hostname.
+  //
+  // Pure-ASCII "xn--" labels are intentionally left on the fast path: with
+  // beStrict=false, domain-to-ASCII returns the lowercased ASCII input even
+  // when Unicode ToASCII would fail (e.g. invalid ACE "xn--a"). See
+  // https://url.spec.whatwg.org/#concept-domain-to-ascii
   bool needs_processing = false;
   for (char c : input) {
     needs_processing |=
         !(char_class_table[static_cast<uint8_t>(c)] & CHAR_SIMPLE_HOSTNAME);
   }
-  if (!needs_processing && !checkers::is_ipv4(input) &&
-      input.find("xn--") == std::string_view::npos) {
+  if (!needs_processing && !checkers::is_ipv4(input)) {
     return std::string(input);
   }
 
@@ -500,25 +502,33 @@ tl::expected<std::string, errors> canonicalize_pathname(
   const bool leading_slash = input.starts_with("/");
   // Let modified value be "/-" if leading slash is false and otherwise the
   // empty string.
-  const auto modified_value = leading_slash ? "" : "/-";
-  const auto full_url =
-      std::string("fake://fake-url") + modified_value + std::string(input);
-  if (auto url = ada::parse<url_aggregator>(full_url, nullptr)) {
-    const auto pathname = url->get_pathname();
-    // If leading slash is false, then set result to the code point substring
-    // from 2 to the end of the string within result.
-    if (!leading_slash) {
-      // pathname should start with "/-" but path traversal (e.g. "../../")
-      // can reduce it to just "/" which is shorter than 2 characters.
-      if (pathname.size() < 2) {
-        return tl::unexpected(errors::type_error);
-      }
-      return std::string(pathname.substr(2));
-    }
-    return std::string(pathname);
+  const auto modified_value =
+      (leading_slash ? std::string() : std::string("/-")) + std::string(input);
+  // The spec runs the basic URL parser with the path in state override, where
+  // '?' and '#' are ordinary path code points (percent-encoded) and leading or
+  // trailing C0 control or space is kept. Building a full URL string and
+  // parsing it (no state override) instead let '?' and '#' start the
+  // query/fragment, so the pathname was silently truncated at the first literal
+  // '?' or '#'. set_pathname runs the parser in path state override, matching
+  // how canonicalize_hostname uses set_hostname.
+  auto url = ada::parse<url_aggregator>("fake://fake-url", nullptr);
+  ADA_ASSERT_TRUE(url);
+  if (!url->set_pathname(modified_value)) {
+    // If parseResult is failure, then throw a TypeError.
+    return tl::unexpected(errors::type_error);
   }
-  // If parseResult is failure, then throw a TypeError.
-  return tl::unexpected(errors::type_error);
+  const auto pathname = url->get_pathname();
+  // If leading slash is false, then set result to the code point substring
+  // from 2 to the end of the string within result.
+  if (!leading_slash) {
+    // pathname should start with "/-" but path traversal (e.g. "../../")
+    // can reduce it to just "/" which is shorter than 2 characters.
+    if (pathname.size() < 2) {
+      return tl::unexpected(errors::type_error);
+    }
+    return std::string(pathname.substr(2));
+  }
+  return std::string(pathname);
 }
 
 tl::expected<std::string, errors> canonicalize_opaque_pathname(
@@ -1109,8 +1119,8 @@ std::string generate_pattern_string(
     // point.
     bool needs_grouping =
         !part.suffix.empty() ||
-        (!part.prefix.empty() && !options.get_prefix().empty() &&
-         part.prefix[0] != options.get_prefix()[0]);
+        (!part.prefix.empty() && (options.get_prefix().empty() ||
+                                  part.prefix[0] != options.get_prefix()[0]));
 
     // If all of the following are true:
     // - needs grouping is false; and

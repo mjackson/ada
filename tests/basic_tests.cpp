@@ -452,11 +452,29 @@ TYPED_TEST(basic_tests, node_issue_47889) {
   ASSERT_TRUE(expected_url->has_opaque_path);
   ASSERT_EQ(expected_url->get_href(), "a:b#");
   ASSERT_EQ(expected_url->get_pathname(), "b");
-  auto url = ada::parse<TypeParam>("..#", &*urlbase);
+  // The base has an opaque path and the input does not begin with '#', so
+  // "no scheme state" returns failure. It must report that instead of
+  // crashing, which is what the node issue asked for.
+  ASSERT_FALSE(ada::parse<TypeParam>("..#", &*urlbase));
+  ASSERT_FALSE(ada::parse<TypeParam>("x#f", &*urlbase));
+  // A fragment-only input is the one relative form such a base accepts.
+  auto url = ada::parse<TypeParam>("#f", &*urlbase);
   ASSERT_TRUE(url);
   ASSERT_TRUE(url->has_opaque_path);
-  ASSERT_EQ(url->get_href(), "a:b/#");
-  ASSERT_EQ(url->get_pathname(), "b/");
+  ASSERT_EQ(url->get_href(), "a:b#f");
+  ASSERT_EQ(url->get_pathname(), "b");
+  SUCCEED();
+}
+
+// A '#' anywhere in the input must not turn an opaque-path base into a
+// hierarchical one: the authority here is never parsed.
+TYPED_TEST(basic_tests, opaque_base_relative_hash_no_authority) {
+  auto base = ada::parse<TypeParam>("about:blank");
+  ASSERT_TRUE(base);
+  ASSERT_TRUE(base->has_opaque_path);
+  ASSERT_FALSE(ada::parse<TypeParam>("//evil.com/p", &*base));
+  ASSERT_FALSE(ada::parse<TypeParam>("//evil.com/p#", &*base));
+  ASSERT_FALSE(ada::parse<TypeParam>("/etc/passwd#", &*base));
   SUCCEED();
 }
 
@@ -696,6 +714,21 @@ TYPED_TEST(basic_tests, nodejs_51593) {
 TYPED_TEST(basic_tests, nodejs_51619) {
   auto out = ada::parse<TypeParam>("https://0.0.0.0x100/");
   ASSERT_FALSE(out);
+  SUCCEED();
+}
+
+TYPED_TEST(basic_tests, ipv4_hex_leading_zeros) {
+  // Leading zeros are permitted in a hex IPv4 number, so digit runs longer
+  // than eight still map to a <= 32-bit value.
+  auto a = ada::parse<TypeParam>("http://0x0000000ff/");
+  ASSERT_TRUE(a);
+  ASSERT_EQ(a->get_hostname(), "0.0.0.255");
+  auto b = ada::parse<TypeParam>("http://0x00000000ff/");
+  ASSERT_TRUE(b);
+  ASSERT_EQ(b->get_hostname(), "0.0.0.255");
+  // A value that genuinely exceeds 32 bits is still rejected.
+  auto c = ada::parse<TypeParam>("http://0x100000000/");
+  ASSERT_FALSE(c);
   SUCCEED();
 }
 
@@ -1047,6 +1080,22 @@ TYPED_TEST(basic_tests, failed_set_host_does_not_poison_set_port) {
             "https://user:pass@example.com:1/path?query=1#hash");
 }
 
+TYPED_TEST(basic_tests, set_host_with_port_strips_dash_dot) {
+  // A non-special URL with a null host and a path starting with "//" carries a
+  // "/." guard in its serialization. Setting a host that contains a port (so
+  // the ":" host/port split is taken) must drop that guard, exactly like the
+  // no-port path already does. url_aggregator used to leave the "/." wedged in
+  // the path, diverging from ada::url.
+  auto url = ada::parse<TypeParam>("non-spec:/.//p");
+  ASSERT_TRUE(url);
+  ASSERT_EQ(url->get_href(), "non-spec:/.//p");
+
+  ASSERT_TRUE(url->set_host("host:99"));
+  ASSERT_EQ(url->get_host(), "host:99");
+  ASSERT_EQ(url->get_pathname(), "//p");
+  ASSERT_EQ(url->get_href(), "non-spec://host:99//p");
+}
+
 TYPED_TEST(basic_tests, get_href_size_matches_get_href) {
   // Verify that get_href_size() returns the same value as get_href().size()
   // across a variety of URLs.
@@ -1168,4 +1217,102 @@ TYPED_TEST(basic_tests, get_href_size_password_no_password) {
   auto url2 = ada::parse<TypeParam>("http://user:pass@example.com/");
   ASSERT_TRUE(url2);
   ASSERT_EQ(url2->get_href_size(), url2->get_href().size());
+}
+
+TYPED_TEST(basic_tests, simple_absolute_fast_path) {
+  {
+    auto url =
+        ada::parse<TypeParam>("https://www.google.com/imghp?hl=en&tab=wi");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_protocol(), "https:");
+    ASSERT_EQ(url->get_hostname(), "www.google.com");
+    ASSERT_EQ(url->get_pathname(), "/imghp");
+    ASSERT_EQ(url->get_search(), "?hl=en&tab=wi");
+    ASSERT_EQ(url->get_href(), "https://www.google.com/imghp?hl=en&tab=wi");
+  }
+  {
+    auto url = ada::parse<TypeParam>("https://example.com");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_pathname(), "/");
+    ASSERT_EQ(url->get_href(), "https://example.com/");
+  }
+  {
+    auto url = ada::parse<TypeParam>("https://example.com?q=1");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_pathname(), "/");
+    ASSERT_EQ(url->get_search(), "?q=1");
+    ASSERT_EQ(url->get_href(), "https://example.com/?q=1");
+  }
+  {
+    auto url = ada::parse<TypeParam>(
+        "https://example.com/path?continue=https%3A%2F%2Fexample.com%2F");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_href(),
+              "https://example.com/path?continue=https%3A%2F%2Fexample.com%2F");
+  }
+  {
+    auto url = ada::parse<TypeParam>("http://WWW.Example.COM/file.js");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_hostname(), "www.example.com");
+    ASSERT_EQ(url->get_pathname(), "/file.js");
+    ASSERT_EQ(url->get_href(), "http://www.example.com/file.js");
+  }
+  {
+    auto url = ada::parse<TypeParam>("https://example.com/a/./b/../c");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_pathname(), "/a/c");
+    ASSERT_EQ(url->get_href(), "https://example.com/a/c");
+  }
+  {
+    auto url = ada::parse<TypeParam>("https://example.com/foo/%2e");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_pathname(), "/foo/");
+    ASSERT_EQ(url->get_href(), "https://example.com/foo/");
+  }
+  {
+    auto url = ada::parse<TypeParam>("https://example.com/foo/%2e%2e");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_pathname(), "/");
+    ASSERT_EQ(url->get_href(), "https://example.com/");
+  }
+  {
+    auto url =
+        ada::parse<TypeParam>("https://user:pass@example.com:8080/x?y=1#z");
+    ASSERT_TRUE(url);
+    ASSERT_EQ(url->get_username(), "user");
+    ASSERT_EQ(url->get_password(), "pass");
+    ASSERT_EQ(url->get_port(), "8080");
+    ASSERT_EQ(url->get_pathname(), "/x");
+    ASSERT_EQ(url->get_search(), "?y=1");
+    ASSERT_EQ(url->get_hash(), "#z");
+  }
+  const char* samples[] = {
+      "https://www.youtube.com/about/",
+      "http://example.com/",
+      "https://maps.google.com/maps?hl=en&tab=wl",
+      "https://example.com",
+      "https://example.com?q=1#frag",
+  };
+  for (const char* s : samples) {
+    auto u = ada::parse<ada::url>(s);
+    auto a = ada::parse<ada::url_aggregator>(s);
+    ASSERT_EQ(u.has_value(), a.has_value()) << s;
+    if (u) {
+      ASSERT_EQ(u->get_href(), std::string(a->get_href())) << s;
+    }
+  }
+  SUCCEED();
+}
+
+TEST(url_aggregator, estimated_memory_usage_tracks_retained_capacity) {
+  auto url = ada::parse<ada::url_aggregator>("https://example.com/");
+  ASSERT_TRUE(url);
+
+  const size_t initial_estimate = url->estimated_memory_usage();
+  ASSERT_GE(initial_estimate, url->get_href().size());
+
+  const std::string large_url = "https://example.com/" + std::string(8192, 'a');
+  ASSERT_TRUE(url->set_href(large_url));
+  ASSERT_GE(url->estimated_memory_usage(), url->get_href().size());
+  ASSERT_GT(url->estimated_memory_usage(), initial_estimate);
 }

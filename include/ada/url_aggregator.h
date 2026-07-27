@@ -105,6 +105,17 @@ struct url_aggregator : url_base {
       ada_lifetime_bound;
 
   /**
+   * Estimates the bytes retained by the serialized URL buffer.
+   *
+   * The estimate is allocator-independent and reports the buffer capacity,
+   * not the current serialized URL length or allocator bookkeeping overhead.
+   * It is suitable for embedders that need to account for retained payload
+   * storage.
+   * @return The retained buffer capacity in bytes.
+   */
+  [[nodiscard]] size_t estimated_memory_usage() const noexcept;
+
+  /**
    * Returns the byte length of the serialized URL without allocating a string.
    * @return Size of the href in bytes.
    */
@@ -322,6 +333,8 @@ struct url_aggregator : url_base {
       std::string_view, const url_aggregator*);
   friend url_aggregator parser::parse_url_impl<url_aggregator, false>(
       std::string_view, const url_aggregator*);
+  template <class result_type>
+  friend bool parser::try_parse_simple_absolute(std::string_view, result_type&);
 
 #if ADA_INCLUDE_URL_PATTERN
   // url_pattern methods

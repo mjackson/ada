@@ -179,6 +179,46 @@ TEST(wpt_urlpattern_tests, unmatched_optional_group_keeps_alignment) {
   EXPECT_EQ(pathname_groups.at("1").value_or(""), "b");
 }
 
+// A capture group in a non-wildcard component can match an empty input value:
+// "(x*)" captures the empty string and ":a?" leaves an optional group
+// undefined. These go through the compiled-regex path (not the FULL_WILDCARD
+// fast path), so the group values must still be reported for an empty input.
+TEST(wpt_urlpattern_tests, empty_input_capture_group_reported) {
+  {
+    auto init = ada::url_pattern_init{};
+    init.search = "(x*)";
+    auto pattern = ada::parse_url_pattern<regex_provider>(init);
+    ASSERT_TRUE(pattern);
+
+    auto input = ada::url_pattern_init{};
+    input.search = "";
+    auto result = pattern->exec(input, nullptr);
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->has_value());
+
+    auto& groups = result->value().search.groups;
+    ASSERT_EQ(groups.size(), 1u);
+    EXPECT_EQ(groups.at("0").value_or("<undef>"), "");
+  }
+  {
+    auto init = ada::url_pattern_init{};
+    init.search = ":a?";
+    auto pattern = ada::parse_url_pattern<regex_provider>(init);
+    ASSERT_TRUE(pattern);
+
+    auto input = ada::url_pattern_init{};
+    input.search = "";
+    auto result = pattern->exec(input, nullptr);
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->has_value());
+
+    auto& groups = result->value().search.groups;
+    ASSERT_EQ(groups.size(), 1u);
+    EXPECT_FALSE(groups.at("a").has_value())
+        << "unmatched optional group must be undefined, not absent";
+  }
+}
+
 // Verify that patterns with parentheses in regex values don't parse
 // (URLPattern spec doesn't allow unescaped parentheses in custom regex).
 // This documents the expected behavior and ensures we don't crash.
@@ -455,11 +495,24 @@ TEST(wpt_urlpattern_tests, hostname_ipv4_and_idna_canonicalization) {
     EXPECT_EQ(url->get_hostname(), "127.0.0.1");
   }
   {
-    // Invalid ACE label: the slow path rejects it, the fast path must too.
+    // Invalid ACE label: WHATWG domain-to-ASCII (beStrict=false) accepts
+    // pure-ASCII domains as lowercased input regardless of Unicode ToASCII
+    // validity (web-compat carve-out). URLPattern hostname canonicalization
+    // follows the same path via set_hostname, so "xn--a" is accepted as-is.
+    // See tests/wpt/toascii.json ("Invalid Punycode" -> output "xn--a"),
+    // ada-url/idna to_ascii_tests.ascii_xn_carveout, and
+    // https://url.spec.whatwg.org/#concept-domain-to-ascii
     auto init = ada::url_pattern_init{};
     init.hostname = "xn--a";
     auto url = ada::parse_url_pattern<regex_provider>(init);
-    EXPECT_FALSE(url);
+    ASSERT_TRUE(url);
+    EXPECT_EQ(url->get_hostname(), "xn--a");
+
+    // Uppercase ACE must be lowercased (slow path: not CHAR_SIMPLE_HOSTNAME).
+    init.hostname = "XN--A";
+    url = ada::parse_url_pattern<regex_provider>(init);
+    ASSERT_TRUE(url);
+    EXPECT_EQ(url->get_hostname(), "xn--a");
   }
   {
     // A normal domain still takes the fast path unchanged.
@@ -540,6 +593,135 @@ TEST(wpt_urlpattern_tests, search_and_hash_keep_leading_delimiter) {
     ASSERT_TRUE(dropped);
     EXPECT_FALSE(*dropped);
   }
+}
+
+TEST(wpt_urlpattern_tests, pathname_encodes_query_and_fragment_delimiters) {
+  // "canonicalize a pathname" runs the URL parser in path state override, where
+  // '?' and '#' are ordinary path code points (percent-encoded) rather than
+  // query/fragment delimiters. A literal '?' or '#' in a pathname component
+  // must survive as %3F/%23; dropping everything from it onward would widen the
+  // pattern.
+  for (const auto& [input, expected] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"/a?b", "/a%3Fb"},
+           {"/a#b", "/a%23b"},
+           {"/foo?", "/foo%3F"},
+           {"foo?bar", "foo%3Fbar"},
+           {"/a/../b", "/b"},
+       }) {
+    auto pathname = ada::url_pattern_helpers::canonicalize_pathname(input);
+    ASSERT_TRUE(pathname) << "pathname \"" << input << "\"";
+    EXPECT_EQ(*pathname, expected) << "pathname \"" << input << "\"";
+  }
+  {
+    // An escaped '?' in a pathname pattern is a literal, so the pattern matches
+    // the encoded delimiter and nothing shorter.
+    auto init = ada::url_pattern_init{};
+    init.pathname = "/a\\?b";
+    auto url = ada::parse_url_pattern<regex_provider>(init);
+    ASSERT_TRUE(url);
+    EXPECT_EQ(url->get_pathname(), "/a%3Fb");
+    auto ok = url->test(std::string_view("https://example.com/a%3Fb"), nullptr);
+    ASSERT_TRUE(ok);
+    EXPECT_TRUE(*ok);
+    auto truncated =
+        url->test(std::string_view("https://example.com/a"), nullptr);
+    ASSERT_TRUE(truncated);
+    EXPECT_FALSE(*truncated);
+  }
+}
+
+TEST(wpt_urlpattern_tests, grouped_part_keeps_braces_without_prefix_option) {
+  // "generate a pattern string" needs grouping when a part's prefix is not the
+  // options's prefix code point. Only the pathname options carry a prefix
+  // ('/'), so a prefixed part in any other component always keeps its braces.
+  {
+    auto init = ada::url_pattern_init{};
+    init.hostname = "{-:e}?.example.com";
+    auto url = ada::parse_url_pattern<regex_provider>(init);
+    ASSERT_TRUE(url);
+    EXPECT_EQ(url->get_hostname(), "{-:e}?.example.com");
+    // The optional modifier applies to the whole group, so a bare "-" label
+    // does not match while an absent label does.
+    auto with_dash =
+        url->test(std::string_view("https://-.example.com/"), nullptr);
+    ASSERT_TRUE(with_dash);
+    EXPECT_FALSE(*with_dash);
+    auto without =
+        url->test(std::string_view("https://.example.com/"), nullptr);
+    ASSERT_TRUE(without);
+    EXPECT_TRUE(*without);
+  }
+  {
+    // Recompiling a component from its own serialization has to give back the
+    // same component.
+    auto init = ada::url_pattern_init{};
+    init.search = "{a:x}?";
+    auto url = ada::parse_url_pattern<regex_provider>(init);
+    ASSERT_TRUE(url);
+    EXPECT_EQ(url->get_search(), "{a:x}?");
+    auto round = ada::url_pattern_init{};
+    round.search = std::string(url->get_search());
+    auto again = ada::parse_url_pattern<regex_provider>(round);
+    ASSERT_TRUE(again);
+    EXPECT_EQ(again->get_search(), url->get_search());
+  }
+  {
+    // The pathname options do carry '/' as prefix code point, so a '/'-prefixed
+    // part stays ungrouped there.
+    auto init = ada::url_pattern_init{};
+    init.pathname = "/a{/:b}?";
+    auto url = ada::parse_url_pattern<regex_provider>(init);
+    ASSERT_TRUE(url);
+    EXPECT_EQ(url->get_pathname(), "/a/:b?");
+  }
+}
+
+// A constructor string ending with an unterminated "{" must be rejected. The
+// end token has to reach the state machine so the trailing component is
+// captured and compiled; if it is consumed as group content instead, the
+// component is never set and silently falls back to the "*" wildcard.
+TEST(wpt_urlpattern_tests, constructor_string_unterminated_group) {
+  for (const auto& input : std::vector<std::string>{
+           "https://example.com/a{",
+           "https://example.com/{",
+           "https://example.com{",
+           "https://example.com:80/a{",
+           "https://example.com/a?q{",
+           "https://example.com/a#f{",
+       }) {
+    auto url = ada::parse_url_pattern<regex_provider>(std::string_view(input));
+    EXPECT_FALSE(url) << "pattern \"" << input << "\" should be rejected";
+  }
+  // A balanced group is unaffected.
+  auto url = ada::parse_url_pattern<regex_provider>(
+      std::string_view("https://example.com/a{b}"));
+  ASSERT_TRUE(url);
+  EXPECT_EQ(url->get_hostname(), "example.com");
+  EXPECT_EQ(url->get_pathname(), "/ab");
+}
+
+// "file" is one of the special schemes, so a protocol component that matches it
+// must compile the pathname with the pathname options (segment wildcards stop
+// at "/") and make an absent pathname default to "/".
+TEST(wpt_urlpattern_tests, file_protocol_matches_special_scheme) {
+  for (const auto& input : std::vector<std::string>{
+           "file://host/:x",
+           "{file}://host/:x",
+       }) {
+    auto url = ada::parse_url_pattern<regex_provider>(std::string_view(input));
+    ASSERT_TRUE(url) << "pattern \"" << input << "\"";
+    auto one_segment = url->test(std::string_view("file://host/a"), nullptr);
+    ASSERT_TRUE(one_segment) << "pattern \"" << input << "\"";
+    EXPECT_TRUE(*one_segment) << "pattern \"" << input << "\"";
+    auto two_segments = url->test(std::string_view("file://host/a/b"), nullptr);
+    ASSERT_TRUE(two_segments) << "pattern \"" << input << "\"";
+    EXPECT_FALSE(*two_segments) << "pattern \"" << input << "\"";
+  }
+  auto url =
+      ada::parse_url_pattern<regex_provider>(std::string_view("file://host?q"));
+  ASSERT_TRUE(url);
+  EXPECT_EQ(url->get_pathname(), "/");
 }
 
 // Tests are taken from WPT

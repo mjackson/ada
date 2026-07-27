@@ -104,34 +104,12 @@ extern template ada::result<url_aggregator> parse<url_aggregator>(
 /**
  * Checks whether a URL string can be successfully parsed.
  *
- * This is a fast validation function that checks if a URL string is valid
- * according to the WHATWG URL Standard without fully constructing a URL
- * object. Use this when you only need to validate URLs without needing
- * their parsed components.
- *
- * When `get_max_input_length()` is set to a value smaller than the default,
- * `can_parse` may still return `true` for overlength inputs that are
- * structurally valid, because the fast path skips the length check for
- * performance. Use `parse()` when strict length enforcement is required.
+ * Equivalent to `parse(input, base).has_value()` for every input, including
+ * when `set_max_input_length` rejects a normalized href that exceeds the limit.
  *
  * @param input The URL string to validate. Must be valid ASCII or UTF-8.
- * @param base_input Optional pointer to a base URL string for resolving
- *        relative URLs. If nullptr (default), the input is validated as
- *        an absolute URL.
- *
- * @return `true` if the URL can be parsed successfully, `false` otherwise.
- *
- * @example
- * ```cpp
- * // Check absolute URL
- * bool valid = ada::can_parse("https://example.com"); // true
- * bool invalid = ada::can_parse("not a url");         // false
- *
- * // Check relative URL with base
- * std::string_view base = "https://example.com/";
- * bool relative_valid = ada::can_parse("../path", &base); // true
- * ```
- *
+ * @param base_input Optional base URL string for relative inputs.
+ * @return `true` if parsing would succeed, `false` otherwise.
  * @see https://url.spec.whatwg.org/#dom-url-canparse
  */
 bool can_parse(std::string_view input,
@@ -171,9 +149,13 @@ parse_url_pattern(std::variant<std::string_view, url_pattern_init>&& input,
  * Creates a properly formatted file URL from a local file system path.
  * Handles platform-specific path separators and percent-encoding.
  *
+ * Respects `get_max_input_length()`: if the input path or the resulting
+ * `file://` href would exceed the limit, returns an empty string.
+ *
  * @param path The file system path to convert. Must be valid ASCII or UTF-8.
  *
- * @return A file:// URL string representing the given path.
+ * @return A file:// URL string representing the given path, or empty on
+ *         length-limit rejection.
  */
 std::string href_from_file(std::string_view path);
 
@@ -182,7 +164,9 @@ std::string href_from_file(std::string_view path);
  *
  * Both the raw input and the resulting normalized URL (the href) are checked
  * against this limit. Parsing or setter calls that would produce a URL
- * exceeding this length are rejected. The value must fit in a uint32_t.
+ * exceeding this length are rejected. The same limit also applies to
+ * `href_from_file` and to query strings passed to `url_search_params`
+ * construction / `reset`. The value must fit in a uint32_t.
  * The default is std::numeric_limits<uint32_t>::max() (approximately 4 GB).
  *
  * @param length The new maximum URL length in bytes.
